@@ -1,0 +1,223 @@
+import os
+import re
+import sys
+import time
+import glob
+import shutil
+import signal
+import subprocess
+import urllib.request
+
+# ================= 1. 基础配置 =================
+PORT = 8000
+API_KEY = "sk-kaggle-qwen38"
+SERVED_MODEL_NAME = "qwen3.8-27b"
+MAX_RUN_MINUTES = 120  # 2小时后自动终止会话，防止忘关浪费GPU配额
+
+# ================= 2. 清理残留进程并修复系统 libcuda.so 链接 =================
+print("🧹 正在清理可能残留的后台推理进程...")
+subprocess.run(["pkill", "-9", "-f", "vllm"], stderr=subprocess.DEVNULL)
+subprocess.run(["pkill", "-9", "-f", "EngineCore"], stderr=subprocess.DEVNULL)
+time.sleep(2)
+
+print("🔗 正在定位真实 NVIDIA 驱动库并修复 libcuda.so 链接...")
+real_libcuda = None
+
+ld_out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+for line in ld_out.splitlines():
+    if "libcuda.so" in line and "=>" in line:
+        path = line.split("=>")[-1].strip()
+        if os.path.exists(path):
+            real_libcuda = path
+            break
+
+if not real_libcuda:
+    search_patterns = [
+        "/usr/local/nvidia/lib64/libcuda.so*",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so*",
+        "/usr/lib64/libcuda.so*",
+        "/usr/local/cuda*/targets/x86_64-linux/lib/stubs/libcuda.so*",
+        "/usr/local/cuda*/lib64/stubs/libcuda.so*"
+    ]
+    for pattern in search_patterns:
+        for p in sorted(glob.glob(pattern)):
+            if os.path.exists(p):
+                real_libcuda = p
+                break
+        if real_libcuda:
+            break
+
+if not real_libcuda:
+    raise RuntimeError("❌ 无法在系统中找到 libcuda.so，请检查 Kaggle 右侧 Accelerator 是否已开启 GPU T4 x2！")
+
+for link_path in ["/usr/local/cuda/lib64/libcuda.so", "/usr/lib/libcuda.so"]:
+    os.makedirs(os.path.dirname(link_path), exist_ok=True)
+    if os.path.lexists(link_path):
+        os.remove(link_path)
+    os.symlink(real_libcuda, link_path)
+    print(f"✅ 已强制建立软链接: {real_libcuda} -> {link_path}")
+
+subprocess.run(["ldconfig"], stderr=subprocess.DEVNULL)
+
+# ================= 3. 递归定位挂载目录并完整安装离线依赖 =================
+print("📦 正在搜索本地离线依赖包并安装 vLLM（含 FlashInfer）...")
+wheel_dir = None
+INPUT_MODEL_PATH = None
+
+for root, dirs, files in os.walk("/kaggle/input"):
+    if any(f.endswith(".whl") for f in files):
+        wheel_dir = root
+    if "config.json" in files and "qwen" in root.lower():
+        INPUT_MODEL_PATH = root
+
+if not wheel_dir:
+    raise RuntimeError("❌ 未找到包含 .whl 的离线依赖包，请确认右侧 Input 已添加 vLLM-Offline-Wheels！")
+if not INPUT_MODEL_PATH:
+    raise RuntimeError("❌ 未找到包含 config.json 的 Qwen 模型权重，请确认右侧 Input 已添加模型权重！")
+
+subprocess.run(
+    f"pip install --no-index --find-links='{wheel_dir}' vllm flashinfer-python -q",
+    shell=True,
+    check=False
+)
+subprocess.run(
+    f"pip install --no-index --find-links='{wheel_dir}' vllm -q",
+    shell=True,
+    check=True
+)
+print("✅ vLLM 及 FlashInfer 依赖安装完成！")
+
+# ================= 4. 单进程安全预编译 FlashInfer（指定 T4 算力 7.5） =================
+print("🔧 正在单进程安全预编译 FlashInfer 算子缓存...")
+compile_env = os.environ.copy()
+compile_env["TORCH_CUDA_ARCH_LIST"] = "7.5"
+compile_env["MAX_JOBS"] = "2"
+lib_dir = os.path.dirname(real_libcuda)
+compile_env["LIBRARY_PATH"] = f"{lib_dir}:/usr/local/cuda/lib64:/usr/lib:" + compile_env.get("LIBRARY_PATH", "")
+
+warmup_code = """
+import torch
+import flashinfer
+x = torch.randn(2, 128, dtype=torch.float16, device='cuda')
+w = torch.ones(128, dtype=torch.float16, device='cuda')
+flashinfer.norm.rmsnorm(x, w)
+print('✅ FlashInfer norm 算子单进程预编译成功！')
+"""
+res = subprocess.run(["python", "-c", warmup_code], env=compile_env, capture_output=True, text=True)
+print(res.stdout.strip())
+if res.returncode != 0:
+    print("❌ FlashInfer 预编译报错详情：")
+    print(res.stderr[-3000:])
+    raise RuntimeError("FlashInfer 单进程预编译失败。")
+
+# ================= 5. 完整缓存模型权重至本地高速 NVMe 磁盘 =================
+LOCAL_MODEL_PATH = "/tmp/qwen38_model"
+src_files = sorted(os.listdir(INPUT_MODEL_PATH))
+dst_files = sorted(os.listdir(LOCAL_MODEL_PATH)) if os.path.exists(LOCAL_MODEL_PATH) else []
+
+if src_files != dst_files:
+    print("⚡ 正在将完整模型从云盘缓存至本地高速 NVMe 磁盘（约需 35 秒）...")
+    shutil.rmtree(LOCAL_MODEL_PATH, ignore_errors=True)
+    os.makedirs(LOCAL_MODEL_PATH, exist_ok=True)
+    subprocess.run(f"cp -r '{INPUT_MODEL_PATH}/.' '{LOCAL_MODEL_PATH}/'", shell=True, check=True)
+    print("✅ 本地高速缓存校验完成！")
+else:
+    print("⚡ 检测到完整本地高速缓存已存在，跳过拷贝！")
+
+# ================= 6. 启动单并发 + 32K长上下文 + CUDA Graph 高速推理服务 =================
+print("🚀 正在启动 vLLM 推理引擎（单并发 + 32K超长上下文 + CUDA Graph + 多模态）...")
+
+vllm_env = os.environ.copy()
+vllm_env["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+vllm_env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+vllm_env["TORCH_CUDA_ARCH_LIST"] = "7.5"
+vllm_env["MAX_JOBS"] = "2"
+vllm_env["LIBRARY_PATH"] = f"{lib_dir}:/usr/local/cuda/lib64:/usr/lib:" + vllm_env.get("LIBRARY_PATH", "")
+
+vllm_cmd = [
+    "python", "-m", "vllm.entrypoints.openai.api_server",
+    "--model", LOCAL_MODEL_PATH,
+    "--served-model-name", SERVED_MODEL_NAME,
+    "--api-key", API_KEY,
+    "--host", "0.0.0.0",
+    "--port", str(PORT),
+    "--tensor-parallel-size", "2",
+    "--dtype", "float16",
+    "--max-model-len", "28672",
+    "--gpu-memory-utilization", "0.95",
+    "--max-num-seqs", "1",
+    "--gdn-prefill-backend", "triton",
+    "--cudagraph-capture-sizes", "1",
+    "--max-cudagraph-capture-size", "1",
+    "--compilation-config", '{"cudagraph_mm_encoder": false}',
+    "--limit-mm-per-prompt", '{"image": 2}',
+    "--mm-processor-kwargs", '{"max_pixels": 1003520}',
+    "--enable-auto-tool-choice",
+    "--tool-call-parser", "hermes"
+]
+
+vllm_log = open("vllm.log", "w")
+vllm_proc = subprocess.Popen(vllm_cmd, env=vllm_env, stdout=vllm_log, stderr=subprocess.STDOUT)
+
+# 轮询检测端口是否就绪（最多等待 600 秒，每 15 秒打印最新进度）
+ready = False
+for i in range(350):
+    time.sleep(3)
+    if vllm_proc.poll() is not None:
+        print("❌ vLLM 启动异常退出，完整日志末尾 50 行如下：")
+        os.system("tail -n 50 vllm.log")
+        raise RuntimeError("vLLM 进程崩溃，请检查上述日志。")
+    if i > 0 and i % 5 == 0:
+        last_line = subprocess.run(["tail", "-n", "1", "vllm.log"], capture_output=True, text=True).stdout.strip()
+        print(f"⏳ [{i*3}s] 引擎初始化与 CUDA Graph 捕获中... 最新日志: {last_line[:105]}")
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{PORT}/v1/models",
+            headers={"Authorization": f"Bearer {API_KEY}"}
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status == 200:
+                ready = True
+                break
+    except Exception:
+        pass
+
+if not ready:
+    os.system("tail -n 50 vllm.log")
+    raise RuntimeError("❌ 模型加载超时，请检查日志。")
+
+print("\n✅ Qwen3.8-27B 多模态模型（单并发 + 32K上下文 + 满血加速）已成功加载至双卡 T4！")
+
+# ================= 7. 开启免注册公网 HTTPS 隧道 (已替换为 pycloudflared 逻辑) =================
+print("🌐 正在安装并启动 Cloudflare 免费隧道...")
+
+# 1. 清理之前残留的无效文件
+subprocess.run(["rm", "-f", "/usr/local/bin/cloudflared"], check=False)
+
+# 2. 通过 pip 安装 pycloudflared（走 PyPI 源，避免 GitHub 下载异常）
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pycloudflared"], check=True)
+
+# 3. 启动隧道并提取公网地址
+from pycloudflared import try_cloudflare
+
+tunnel_url = try_cloudflare(port=PORT)
+print("\n" + "=" * 62)
+print("🎉 Cloudflare 隧道打通成功！请更新 Cherry Studio 配置：")
+print(f"🔗 Base URL : {tunnel_url.tunnel}/v1")
+print(f"🔑 API Key  : {API_KEY}")
+print(f"🤖 Model    : {SERVED_MODEL_NAME}")
+print("=" * 62 + "\n")
+
+# ================= 8. 自动停机保护计时 =================
+try:
+    for remaining in range(MAX_RUN_MINUTES, 0, -15):
+        print(f"⏳ 运行中... 距离自动停机还剩 {remaining} 分钟（用完请点右上角电源键 Stop Session 省配额）")
+        time.sleep(15 * 60)
+except KeyboardInterrupt:
+    print("\n🛑 收到手动停止指令...")
+finally:
+    print("🧹 正在关闭服务并释放 Kaggle GPU 资源...")
+    subprocess.run(["pkill", "-9", "-f", "cloudflared"], stderr=subprocess.DEVNULL)
+    vllm_proc.terminate()
+    subprocess.run(["pkill", "-9", "-f", "vllm"], stderr=subprocess.DEVNULL)
+    os.kill(os.getpid(), signal.SIGKILL)

@@ -1,0 +1,119 @@
+
+Step 0 (Detailed)
+
+(1) Click your avatar in the top-right corner on Kaggle, then select "Your API tokens". Request Legacy API Credentials — this will download a JSON file. Copy down your username and key for later use.
+
+(2) Run the following code to configure your environment:
+
+import os
+import json
+
+# 1. Fill in the information from your kaggle.json
+KAGGLE_USERNAME = "your_username"
+KAGGLE_KEY = "your_key"
+
+os.environ["KAGGLE_USERNAME"] = KAGGLE_USERNAME
+os.environ["KAGGLE_KEY"] = KAGGLE_KEY
+
+# Install required tools
+!pip install -q huggingface_hub kaggle
+
+# Create temporary directories (using /tmp which has 50GB+ space, avoiding the 20GB limit on /kaggle/working)
+os.makedirs("/tmp/qwen_pack", exist_ok=True)
+os.makedirs("/tmp/wheels_pack", exist_ok=True)
+
+
+(3) Run the following code to download the model weights:
+
+from huggingface_hub import snapshot_download
+import json
+
+# Replace with a real public AWQ quantized repository (~21.5 GB, no HF_TOKEN required)
+MODEL_REPO = "nicosuter/Qwen3.8-27B-AWQ" 
+MODEL_DIR = "/tmp/qwen_pack"
+
+print(f"📥 Downloading model in pure CPU mode: {MODEL_REPO} ...")
+snapshot_download(
+    repo_id=MODEL_REPO,
+    local_dir=MODEL_DIR,
+    ignore_patterns=["*.msgpack", "*.h5", "*.ot", "*.md"]
+)
+
+# Generate dataset metadata file
+dataset_meta = {
+    "title": "Qwen3.8-27B-AWQ-Weights",
+    "id": f"{KAGGLE_USERNAME}/qwen3-8-27b-awq-weights",
+    "licenses": [{"name": "other"}]
+}
+with open(f"{MODEL_DIR}/dataset-metadata.json", "w") as f:
+    json.dump(dataset_meta, f)
+
+print("🚀 Packaging and uploading model weights to your private Kaggle Dataset...")
+!kaggle datasets create -p /tmp/qwen_pack --dir-mode zip
+print("✅ Model Dataset created successfully!")
+
+
+(4) Download vLLM and cloudflared offline dependency packages:
+
+print("📦 Downloading vLLM and cloudflared offline dependency packages...")
+# Download Python wheels for Linux x86_64 platform (matching Kaggle GPU environment)
+!pip download vllm openai \
+    --dest /tmp/wheels_pack \
+    --platform manylinux2014_x86_64 \
+    --python-version 3.10 \
+    --only-binary=:all: -q
+
+# Also include the tunneling tool
+!wget -q https://github.com -O /tmp/wheels_pack/cloudflared.deb
+
+# Generate Dataset metadata for the dependency packages
+wheels_meta = {
+    "title": "vLLM-Offline-Wheels",
+    "id": f"{KAGGLE_USERNAME}/vllm-offline-wheels",
+    "licenses": [{"name": "other"}]
+}
+with open("/tmp/wheels_pack/dataset-metadata.json", "w") as f:
+    json.dump(wheels_meta, f)
+
+print("🚀 Uploading dependency packages to your private Kaggle Dataset...")
+!kaggle datasets create -p /tmp/wheels_pack --dir-mode zip
+print("🎉 Preprocessing complete!")
+
+
+(5) Persist the dependency packages to your personal workspace:
+
+import os, json, shutil
+
+# 1. Fill in your information
+KAGGLE_USERNAME = "your_username"
+KAGGLE_KEY = "your_key"
+
+os.makedirs("/root/.kaggle", exist_ok=True)
+with open("/root/.kaggle/kaggle.json", "w") as f:
+    json.dump({"username": KAGGLE_USERNAME, "key": KAGGLE_KEY}, f)
+os.chmod("/root/.kaggle/kaggle.json", 0o600)
+
+# 2. Clean up old directory and re-download wheels fully compatible with the current Python 3.13
+shutil.rmtree("/tmp/wheels_cp313", ignore_errors=True)
+os.makedirs("/tmp/wheels_cp313", exist_ok=True)
+
+print("📦 Fetching pre-compiled vLLM packages compatible with the current environment in pure CPU mode...")
+# Do not hardcode python-version; download binary packages matching the current environment (Python 3.13)
+!pip download vllm openai --dest /tmp/wheels_cp313 --prefer-binary
+!wget -q https://github.com -O /tmp/wheels_cp313/cloudflared.deb
+
+# 3. Update the existing vLLM-Offline-Wheels dataset (upload a new version)
+wheels_meta = {
+    "title": "vLLM-Offline-Wheels",
+    "id": f"{KAGGLE_USERNAME}/vllm-offline-wheels",
+    "licenses": [{"name": "other"}]
+}
+with open("/tmp/wheels_cp313/dataset-metadata.json", "w") as f:
+    json.dump(wheels_meta, f)
+
+print("🚀 Uploading new version to overwrite the old offline packages Dataset...")
+!kaggle datasets version -p /tmp/wheels_cp313 -m "Update to Python 3.13 wheels" --dir-mode zip
+print("✅ Offline dependency packages updated! You may now close this CPU session.")
+
+
+⚠️ Note: The wget URL in steps (4) and (5) (https://github.com) appears to be a placeholder — it should point to the actual cloudflared .deb release URL. Please replace it with the correct download link before running.
